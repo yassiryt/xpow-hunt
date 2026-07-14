@@ -1,0 +1,75 @@
+{
+  "mcpServers": {
+    "browser-live": {
+      "command": "__XPOW_HOME__/.claude/mcp/browser-live-launch.sh",
+      "env": {
+        "BROWSER_LIVE_CHROME_DEVTOOLS_MCP_ROOT": "__XPOW_HOME__/.local/share/browser-live/chrome-devtools-mcp/node_modules/chrome-devtools-mcp",
+        "BROWSER_LIVE_USE_MCP_PROXY": "0",
+        "BROWSER_LIVE_CHROME_BIN": "/usr/bin/chromium",
+        "BROWSER_LIVE_MAX_TABS": "10",
+        "NODE_OPTIONS": "--max-old-space-size=512"
+      },
+      "timeout": 180000,
+      "disabled": false
+    },
+    "burp": {
+      "command": "/usr/bin/java",
+      "args": [
+        "-Xmx256m",
+        "-jar",
+        "__XPOW_HOME__/.BurpSuite/mcp-proxy/mcp-proxy-all.jar",
+        "--sse-url",
+        "http://127.0.0.1:9876"
+      ],
+      "timeout": 60000,
+      "disabled": false
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "env": {
+        "MEMORY_FILE_PATH": "__XPOW_HOME__/.config/opencode/memory/memory.jsonl"
+      },
+      "timeout": 30000,
+      "disabled": false
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_MCP_TOKEN}",
+        "X-MCP-Tools": "search_code,search_repositories,get_file_contents,get_repository_tree,search_issues,search_pull_requests",
+        "X-MCP-Readonly": "true"
+      },
+      "timeout": 45000,
+      "disabled": false
+    },
+    "medium": {
+      "command": "node",
+      "args": [
+        "__XPOW_HOME__/opencode/medium-rss-mcp/server.mjs"
+      ],
+      "env": {
+        "NODE_OPTIONS": "--max-old-space-size=128"
+      },
+      "timeout": 30000,
+      "disabled": false
+    },
+    "gmail": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@gongrzhe/server-gmail-autoauth-mcp"
+      ],
+      "env": {
+        "GMAIL_OAUTH_PATH": "__XPOW_HOME__/.gmail-mcp/gcp-oauth.keys.json",
+        "GMAIL_CREDENTIALS_PATH": "__XPOW_HOME__/.gmail-mcp/credentials.json",
+        "NODE_OPTIONS": "--max-old-space-size=256"
+      },
+      "timeout": 45000,
+      "disabled": false
+    }
+  }
+}

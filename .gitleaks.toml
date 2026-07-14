@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Upstream gateway documentation uses explicit placeholder Authorization headers"
+paths = [
+  '''^kiro-gateway/docs/''',
+  '''^kiro-gateway/.github/workflows/docker\.yml$'''
+]

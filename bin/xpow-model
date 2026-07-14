@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Set the default xpow-hunt gateway.
+set -euo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/xpow-hunt"
+FILE="$CONFIG_HOME/backend"
+choice="${1:-status}"
+
+case "$choice" in
+  kiro|claude|zai)
+    mkdir -p "$CONFIG_HOME"
+    printf '%s\n' "$choice" > "$FILE"
+    chmod 600 "$FILE"
+    echo "xpow-hunt gateway: $choice"
+    ;;
+  status)
+    printf 'xpow-hunt gateway: %s\n' "$([ -r "$FILE" ] && tr -d '[:space:]' < "$FILE" || printf 'kiro')"
+    ;;
+  *)
+    echo "usage: xpow-model {kiro|claude|zai|status}" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,22 @@
+[Unit]
+Description=Kiro Gateway (Anthropic<->Kiro bridge for xpow-hunt)
+# Never stop restarting: default rate-limit would mark the unit failed
+# after 5 crashes within 10s. We want it to keep coming back, always.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=__XPOW_HOME__/tools/kiro-gateway
+Environment=PYTHONFAULTHANDLER=1
+ExecStart=__XPOW_HOME__/tools/kiro-gateway/.venv/bin/python main.py --port 8790
+# Self-heal on any exit (crash, OOM-kill, etc.)
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+KillMode=mixed
+# App logs keep appending to gw.log (also captured by journald)
+StandardOutput=append:__XPOW_HOME__/tools/kiro-gateway/gw.log
+StandardError=append:__XPOW_HOME__/tools/kiro-gateway/gw.log
+
+[Install]
+WantedBy=default.target

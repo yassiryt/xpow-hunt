@@ -1,0 +1,39 @@
+{
+    "defaultProvider": "kiro",
+    "defaultModel": "claude-opus-4.8",
+    "theme": "dark",
+    "defaultThinkingLevel": "xhigh",
+    "thinkingBudgets": {
+        "low": 8192,
+        "medium": 16384,
+        "high": 32768,
+        "xhigh": 60000
+    },
+    "skills": [
+        "~/.kiro/skills"
+    ],
+    "enableSkillCommands": true,
+    "warnings": {
+        "anthropicExtraUsage": false
+    },
+    "retry": {
+        "enabled": true,
+        "maxRetries": 5,
+        "provider": {
+            "maxRetries": 0
+        }
+    },
+    "branchSummary": {
+        "skipPrompt": true
+    },
+    "compaction": {
+        "enabled": true,
+        "keepRecentTokens": 20000
+    },
+    "lastChangelogVersion": "0.79.0",
+    "packages": [
+        "npm:pi-hermes-memory",
+        "npm:pi-agent-memory",
+        "npm:@ogulcancelik/pi-web-browse"
+    ]
+}

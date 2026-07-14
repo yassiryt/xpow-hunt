@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Starts the local Kiro compatibility gateway when needed, then runs Pi.
+set -euo pipefail
+
+GW="$HOME/tools/kiro-gateway"
+PORT="${KIRO_GW_PORT:-8790}"
+HEALTH="http://127.0.0.1:$PORT/health"
+
+healthy() { curl -fsS --max-time 3 "$HEALTH" >/dev/null 2>&1; }
+
+if ! healthy; then
+  [ -x "$GW/.venv/bin/python" ] || { echo "xpow-gateway: gateway is not installed at $GW" >&2; exit 1; }
+  echo "xpow-gateway: starting Kiro bridge on 127.0.0.1:$PORT" >&2
+  (cd "$GW" && nohup .venv/bin/python main.py --host 127.0.0.1 --port "$PORT" >gw.log 2>&1 & echo $! >gw.pid)
+  for _ in $(seq 1 20); do healthy && break; sleep 1; done
+  healthy || { echo "xpow-gateway: startup failed; inspect $GW/gw.log" >&2; exit 1; }
+fi
+
+exec pi "$@"

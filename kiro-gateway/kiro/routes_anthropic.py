@@ -1,0 +1,832 @@
+# -*- coding: utf-8 -*-
+
+# Kiro Gateway
+# https://github.com/jwadow/kiro-gateway
+# Copyright (C) 2025 Jwadow
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""
+FastAPI routes for Anthropic Messages API.
+
+Contains the /v1/messages endpoint compatible with Anthropic's Messages API.
+
+Reference: https://docs.anthropic.com/en/api/messages
+"""
+
+import json
+import os
+import asyncio
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, Security, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
+from loguru import logger
+
+from kiro.config import PROXY_API_KEY, WEB_SEARCH_ENABLED, ALLOW_ANY_ANTHROPIC_KEY
+from kiro.models_anthropic import (
+    AnthropicMessagesRequest,
+    AnthropicMessagesResponse,
+    AnthropicErrorResponse,
+    AnthropicErrorDetail,
+)
+from kiro.auth import KiroAuthManager, AuthType
+from kiro.cache import ModelInfoCache
+from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.streaming_anthropic import (
+    stream_kiro_to_anthropic,
+    collect_anthropic_response,
+)
+from kiro.http_client import KiroHttpClient
+from kiro.utils import generate_conversation_id
+from kiro.tokenizer import count_tools_tokens, count_tokens, count_message_tokens, count_payload_tokens
+
+# Import debug_logger
+try:
+    from kiro.debug_logger import debug_logger
+except ImportError:
+    debug_logger = None
+
+
+# --- Security scheme ---
+# Anthropic uses x-api-key header instead of Authorization: Bearer
+anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+# Also support Authorization: Bearer for compatibility
+auth_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+
+async def verify_anthropic_api_key(
+    x_api_key: Optional[str] = Security(anthropic_api_key_header),
+    authorization: Optional[str] = Security(auth_header)
+) -> bool:
+    """
+    Verify API key for Anthropic API.
+
+    Supports two authentication methods:
+    1. x-api-key header (Anthropic native)
+    2. Authorization: Bearer header (for compatibility)
+
+    When ALLOW_ANY_ANTHROPIC_KEY is enabled (default), any non-empty key is
+    accepted. This lets clients like Claude Code Desktop work even when they
+    send their own OAuth token (sk-ant-oat...) instead of the proxy key.
+    The client key is consumed at the gateway boundary — it is never
+    forwarded to Kiro.
+
+    Args:
+        x_api_key: Value from x-api-key header
+        authorization: Value from Authorization header
+
+    Returns:
+        True if key is valid
+
+    Raises:
+        HTTPException: 401 if key is invalid or missing
+    """
+    # Check x-api-key first (Anthropic native)
+    if x_api_key and x_api_key == PROXY_API_KEY:
+        return True
+
+    # Fall back to Authorization: Bearer
+    if authorization and authorization == f"Bearer {PROXY_API_KEY}":
+        return True
+
+    # Permissive mode: accept any non-empty key (local proxy convenience)
+    if ALLOW_ANY_ANTHROPIC_KEY:
+        bearer_token = None
+        if authorization and authorization.startswith("Bearer "):
+            bearer_token = authorization[len("Bearer "):].strip()
+        if (x_api_key and x_api_key.strip()) or (bearer_token):
+            return True
+
+    def _redact(value: Optional[str], keep: int = 4) -> str:
+        if not value:
+            return "<missing>"
+        return f"{value[:keep]}…(len={len(value)})"
+
+    logger.warning(
+        "Access attempt with invalid API key (Anthropic endpoint) | "
+        f"x-api-key={_redact(x_api_key)} | authorization={_redact(authorization, keep=16)}"
+    )
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": "Invalid or missing API key. Use x-api-key header or Authorization: Bearer."
+            }
+        }
+    )
+
+
+# --- Router ---
+router = APIRouter(tags=["Anthropic API"])
+
+
+@router.post("/v1/messages", dependencies=[Depends(verify_anthropic_api_key)])
+async def messages(
+    request: Request,
+    request_data: AnthropicMessagesRequest,
+    anthropic_version: Optional[str] = Header(None, alias="anthropic-version")
+):
+    """
+    Anthropic Messages API endpoint.
+    
+    Compatible with Anthropic's /v1/messages endpoint.
+    Accepts requests in Anthropic format and translates them to Kiro API.
+    
+    Required headers:
+    - x-api-key: Your API key (or Authorization: Bearer)
+    - anthropic-version: API version (optional, for compatibility)
+    - Content-Type: application/json
+    
+    Args:
+        request: FastAPI Request for accessing app.state
+        request_data: Request in Anthropic MessagesRequest format
+        anthropic_version: Anthropic API version header (optional)
+    
+    Returns:
+        StreamingResponse for streaming mode (SSE)
+        JSONResponse for non-streaming mode
+    
+    Raises:
+        HTTPException: On validation or API errors
+    """
+    logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
+    
+    if anthropic_version:
+        logger.debug(f"Anthropic-Version header: {anthropic_version}")
+    
+    auth_manager: KiroAuthManager = request.app.state.auth_manager
+    model_cache: ModelInfoCache = request.app.state.model_cache
+    
+    # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
+    # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
+    
+    # Check for truncation recovery opportunities
+    from kiro.truncation_state import get_tool_truncation, get_content_truncation
+    from kiro.truncation_recovery import generate_truncation_tool_result, generate_truncation_user_message
+    from kiro.models_anthropic import AnthropicMessage
+    
+    # --- Anti-poison: repair empty assistant messages -----------------------
+    # A turn that returned an empty completion (content == [] / "" / no real
+    # blocks) gets written into the conversation history. Because the full
+    # history is replayed every request, that empty assistant turn poisons the
+    # conversation — every later turn (including a manual "Continue") then also
+    # comes back empty and the session can't recover. Replace any empty
+    # assistant message with a minimal non-empty placeholder so history stays
+    # valid and the model resumes normally.
+    # Known gateway/agent placeholder strings. If these accumulate in history the
+    # model (especially opus-4.7) can start MIMICKING them, emitting e.g. "(no
+    # output)" as its own "answer" -> a non-empty-looking turn that is really an
+    # empty response. We strip them from history (so the pattern disappears) and
+    # also treat a fresh placeholder-only completion as empty (see stream_wrapper).
+    _KNOWN_PLACEHOLDERS = ("(no output)", "(empty placeholder)", "(continuing)")
+    _PH_LOWER = tuple(p.lower() for p in _KNOWN_PLACEHOLDERS)
+    _PH_LOWER_SET = set(_PH_LOWER)
+
+    def _is_placeholder_text(txt) -> bool:
+        return (txt or "").strip().lower() in _PH_LOWER_SET
+
+    def _text_is_placeholderish(acc) -> bool:
+        # True while the leading text is empty or still a prefix of (or equal to) a
+        # known placeholder -> ambiguous, keep buffering. False once it diverges
+        # (clearly real text) so streaming resumes with negligible delay.
+        s = (acc or "").strip().lower()
+        if s == "":
+            return True
+        return any(p.startswith(s) for p in _PH_LOWER)
+
+    def _sse_parse(chunk):
+        # minimal SSE chunk -> (event_type, data_dict|None)
+        _et = None
+        _payload = None
+        for _ln in chunk.split("\n"):
+            if _ln.startswith("event:"):
+                _et = _ln[6:].strip()
+            elif _ln.startswith("data:"):
+                _d = _ln[5:].strip()
+                if _d:
+                    try:
+                        _payload = json.loads(_d)
+                    except Exception:
+                        _payload = None
+        return _et, _payload
+
+    def _is_empty_assistant_content(content) -> bool:
+        if content is None:
+            return True
+        if isinstance(content, str):
+            return content.strip() == "" or _is_placeholder_text(content)
+        if isinstance(content, list):
+            for b in content:
+                bt = b.get("type") if isinstance(b, dict) else getattr(b, "type", None)
+                if bt in ("tool_use", "thinking", "redacted_thinking", "image"):
+                    return False
+                if bt == "text":
+                    txt = b.get("text") if isinstance(b, dict) else getattr(b, "text", "")
+                    if (txt or "").strip() and not _is_placeholder_text(txt):
+                        return False
+            return True
+        return False
+
+    # --- History sanitizer (root-cause fix for empty completions) -----------
+    # ROOT CAUSE: replaying prior-turn `thinking` blocks while extended thinking
+    # (effort) is enabled makes Kiro/CodeWhisperer return an EMPTY completion; the
+    # failure grows with the number of accumulated historical thinking blocks.
+    # But thinking blocks hold the model's reasoning, so we don't blindly drop all
+    # of them. Mode-controlled (x-thinking-mode header > KIRO_THINKING_HISTORY env
+    # > default), where N = KIRO_THINKING_KEEP_LAST (default 1):
+    #   keep_last (default): keep thinking only on the most-recent N assistant
+    #       turns (the active reasoning the model needs to continue a tool loop);
+    #       strip it from older, completed turns (which the model re-derives fresh
+    #       each turn under effort=max). Preserves smartness, avoids the empty.
+    #   keep_last_nosig: keep_last but drop signatures.   nosig: keep all, no sig.
+    #   strip: remove all thinking.   keep: passthrough (debug only).
+    # Empty assistant turns are always repaired to a non-empty placeholder.
+    def _blk_get(_b, _k):
+        return _b.get(_k) if isinstance(_b, dict) else getattr(_b, _k, None)
+
+    _tmode = (request.headers.get("x-thinking-mode")
+              or os.getenv("KIRO_THINKING_HISTORY") or "keep_last").strip().lower()
+    try:
+        _keepN = int(request.headers.get("x-thinking-keep") or os.getenv("KIRO_THINKING_KEEP_LAST") or "1")
+    except Exception:
+        _keepN = 1
+    # positions (message_index, block_index) of every thinking block, in order
+    _think_pos = []
+    for _i, _mm in enumerate(request_data.messages):
+        _cc = _mm.content
+        if _mm.role == "assistant" and isinstance(_cc, list):
+            for _j, _bb in enumerate(_cc):
+                if _blk_get(_bb, "type") in ("thinking", "redacted_thinking"):
+                    _think_pos.append((_i, _j))
+    _keep_pos = set(_think_pos[-_keepN:]) if _keepN > 0 else set()
+
+    _empty_fixed = 0
+    _thinking_removed = 0
+    _sig_dropped = 0
+    _ph_stripped = 0
+    _sanitized = []
+    for _i, _m in enumerate(request_data.messages):
+        if _m.role != "assistant":
+            _sanitized.append(_m)
+            continue
+        _content = _m.content
+        _changed = False
+        if isinstance(_content, list):
+            _kept = []
+            for _j, _b in enumerate(_content):
+                _bt = _blk_get(_b, "type")
+                if _bt in ("thinking", "redacted_thinking"):
+                    if _tmode == "keep" or _tmode == "nosig":
+                        _keep_here = True
+                    elif _tmode == "strip":
+                        _keep_here = False
+                    else:  # keep_last / keep_last_nosig
+                        _keep_here = (_i, _j) in _keep_pos
+                    if not _keep_here:
+                        _thinking_removed += 1
+                        _changed = True
+                        continue
+                    if _tmode in ("nosig", "keep_last_nosig"):
+                        _kept.append({"type": _bt, "thinking": _blk_get(_b, "thinking") or _blk_get(_b, "text") or ""})
+                        _sig_dropped += 1
+                        _changed = True
+                    else:
+                        _kept.append(_b)
+                elif _bt == "text" and _is_placeholder_text(_blk_get(_b, "text")):
+                    # drop placeholder-only text blocks so the model can't learn to
+                    # mimic them (it was emitting "(no output)"/"(empty placeholder)")
+                    _ph_stripped += 1
+                    _changed = True
+                else:
+                    _kept.append(_b)
+            _content = _kept
+        if _is_empty_assistant_content(_content):
+            _sanitized.append(_m.model_copy(update={"content": [{"type": "text", "text": "(continuing)"}]}))
+            _empty_fixed += 1
+        elif _changed:
+            _sanitized.append(_m.model_copy(update={"content": _content}))
+        else:
+            _sanitized.append(_m)
+    if _empty_fixed or _thinking_removed or _sig_dropped or _ph_stripped:
+        request_data.messages = _sanitized
+        logger.info(f"History sanitized [mode={_tmode},keepN={_keepN}]: thinking_removed={_thinking_removed}, sig_dropped={_sig_dropped}, empty_repaired={_empty_fixed}, placeholders_stripped={_ph_stripped}")
+
+    modified_messages = []
+    tool_results_modified = 0
+    content_notices_added = 0
+    
+    for msg in request_data.messages:
+        # Check if this is a user message with tool_result blocks
+        if msg.role == "user" and msg.content and isinstance(msg.content, list):
+            modified_content_blocks = []
+            has_modifications = False
+            
+            for block in msg.content:
+                # Handle both dict and Pydantic objects (ToolResultContentBlock)
+                if isinstance(block, dict):
+                    block_type = block.get("type")
+                    tool_use_id = block.get("tool_use_id")
+                    original_content = block.get("content", "")
+                elif hasattr(block, "type"):
+                    block_type = block.type
+                    tool_use_id = getattr(block, "tool_use_id", None)
+                    original_content = getattr(block, "content", "")
+                else:
+                    modified_content_blocks.append(block)
+                    continue
+                
+                if block_type == "tool_result" and tool_use_id:
+                    truncation_info = get_tool_truncation(tool_use_id)
+                    if truncation_info:
+                        # Modify tool_result content to include truncation notice
+                        synthetic = generate_truncation_tool_result(
+                            tool_name=truncation_info.tool_name,
+                            tool_use_id=tool_use_id,
+                            truncation_info=truncation_info.truncation_info
+                        )
+                        # Prepend truncation notice to original content
+                        modified_content = f"{synthetic['content']}\n\n---\n\nOriginal tool result:\n{original_content}"
+                        
+                        # Create modified block (handle both dict and Pydantic)
+                        if isinstance(block, dict):
+                            modified_block = block.copy()
+                            modified_block["content"] = modified_content
+                        else:
+                            # Pydantic object - use model_copy
+                            modified_block = block.model_copy(update={"content": modified_content})
+                        
+                        modified_content_blocks.append(modified_block)
+                        tool_results_modified += 1
+                        has_modifications = True
+                        logger.debug(f"Modified tool_result for {tool_use_id} to include truncation notice")
+                        continue
+                
+                modified_content_blocks.append(block)
+            
+            # Create NEW AnthropicMessage object if modifications were made (Pydantic immutability)
+            if has_modifications:
+                modified_msg = msg.model_copy(update={"content": modified_content_blocks})
+                modified_messages.append(modified_msg)
+                continue  # Skip normal append since we already added modified version
+        
+        # Check if this is an assistant message with truncated content
+        if msg.role == "assistant" and msg.content:
+            # Extract text content for hash check
+            text_content = ""
+            if isinstance(msg.content, str):
+                text_content = msg.content
+            elif isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_content += block.get("text", "")
+            
+            if text_content:
+                truncation_info = get_content_truncation(text_content)
+                if truncation_info:
+                    # Add this message first
+                    modified_messages.append(msg)
+                    # Then add synthetic user message about truncation
+                    synthetic_user_msg = AnthropicMessage(
+                        role="user",
+                        content=[{"type": "text", "text": generate_truncation_user_message()}]
+                    )
+                    modified_messages.append(synthetic_user_msg)
+                    content_notices_added += 1
+                    logger.debug(f"Added truncation notice after assistant message (hash: {truncation_info.message_hash})")
+                    continue  # Skip normal append since we already added it
+        
+        modified_messages.append(msg)
+    
+    if tool_results_modified > 0 or content_notices_added > 0:
+        request_data.messages = modified_messages
+        logger.info(f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)")
+
+    # ==========================================================================
+    # WebSearch — Path B: auto-inject web_search as a regular tool
+    # Model decides whether to use it; streaming layer intercepts the call.
+    # ==========================================================================
+    if WEB_SEARCH_ENABLED:
+        if request_data.tools is None:
+            request_data.tools = []
+        has_ws = any(getattr(t, "name", None) == "web_search" for t in request_data.tools)
+        if not has_ws:
+            from kiro.models_anthropic import AnthropicTool
+            request_data.tools.append(AnthropicTool(
+                name="web_search",
+                description=(
+                    "Search the web for current information. "
+                    "Use when you need up-to-date data from the internet."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "Search query"}},
+                    "required": ["query"],
+                },
+            ))
+            logger.debug("Auto-injected web_search tool (Path B)")
+
+    # ==========================================================================
+    # WebSearch — Path A: native Anthropic server-side tool → direct MCP call
+    # This always runs regardless of WEB_SEARCH_ENABLED.
+    # ==========================================================================
+    if request_data.tools:
+        for tool in request_data.tools:
+            tool_type = getattr(tool, "type", None)
+            if tool_type and tool_type.startswith("web_search"):
+                from kiro.mcp_tools import handle_native_web_search
+                logger.info("Detected native Anthropic web_search (Path A), routing to MCP API")
+                return await handle_native_web_search(request, request_data, auth_manager)
+
+    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
+    conversation_id = generate_conversation_id()
+    
+    # Build payload for Kiro
+    # profileArn is only needed for Kiro Desktop auth
+    profile_arn_for_payload = ""
+    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+        profile_arn_for_payload = auth_manager.profile_arn
+    
+    try:
+        kiro_payload, tool_name_map = anthropic_to_kiro(
+            request_data,
+            conversation_id,
+            profile_arn_for_payload
+        )
+    except ValueError as e:
+        logger.error(f"Conversion error: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": str(e)
+                }
+            }
+        )
+    
+    # Log Kiro payload
+    try:
+        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+        if debug_logger:
+            debug_logger.log_kiro_request_body(kiro_request_body)
+    except Exception as e:
+        logger.warning(f"Failed to log Kiro request: {e}")
+    
+    # Create HTTP client with retry logic
+    # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
+    # For non-streaming: use shared client for connection pooling
+    url = f"{auth_manager.api_host}/generateAssistantResponse"
+    logger.debug(f"Kiro API URL: {url}")
+    
+    if request_data.stream:
+        # Streaming mode: per-request client prevents orphaned connections
+        # when network interface changes (VPN disconnect/reconnect)
+        http_client = KiroHttpClient(auth_manager, shared_client=None)
+    else:
+        # Non-streaming mode: shared client for efficient connection reuse
+        shared_client = request.app.state.http_client
+        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+    
+    # Prepare data for token counting
+    # Convert Pydantic models to dicts for tokenizer
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+
+    # Real input-token count. Count each component ONCE (system + messages +
+    # tools). NOTE: do NOT recursively walk the kiro_payload — tool schemas get
+    # traversed per-occurrence there and inflate the count ~10x (a ~219K context
+    # read as ~2.1M, which made pi show 210% and over-compact). count_message_tokens
+    # and count_tools_tokens already handle every structured block correctly.
+    try:
+        _sys_text = ""
+        if request_data.system:
+            if isinstance(request_data.system, str):
+                _sys_text = request_data.system
+            elif isinstance(request_data.system, list):
+                _parts = []
+                for _b in request_data.system:
+                    _t = _b.get("text") if isinstance(_b, dict) else getattr(_b, "text", None)
+                    if _t:
+                        _parts.append(_t)
+                _sys_text = "\n".join(_parts)
+        _msg_tok = count_message_tokens(messages_for_tokenizer)
+        _tool_tok = count_tools_tokens(tools_for_tokenizer)
+        _sys_tok = count_tokens(_sys_text)
+        real_input_tokens = _msg_tok + _tool_tok + _sys_tok
+        logger.info(f"[tokens] real input = {real_input_tokens:,} (msgs={_msg_tok:,} tools={_tool_tok:,} sys={_sys_tok:,} n_tools={len(tools_for_tokenizer or [])})")
+    except Exception as _e:
+        logger.warning(f"[tokens] input token count failed: {_e}")
+        real_input_tokens = None
+    
+    try:
+        # Make request to Kiro API (for both streaming and non-streaming modes)
+        # Important: we wait for Kiro response BEFORE returning StreamingResponse,
+        # so that we can return proper HTTP error codes if Kiro fails
+        response = await http_client.request_with_retry(
+            "POST",
+            url,
+            kiro_payload,
+            stream=True
+        )
+        
+        if response.status_code != 200:
+            try:
+                error_content = await response.aread()
+            except Exception:
+                error_content = b"Unknown error"
+            
+            await http_client.close()
+            error_text = error_content.decode('utf-8', errors='replace')
+            
+            # Try to parse JSON response from Kiro to extract error message
+            error_message = error_text
+            try:
+                error_json = json.loads(error_text)
+                # Enhance Kiro API errors with user-friendly messages
+                from kiro.kiro_errors import enhance_kiro_error
+                error_info = enhance_kiro_error(error_json)
+                error_message = error_info.user_message
+                # Log original error for debugging
+                logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
+            except (json.JSONDecodeError, KeyError):
+                pass
+            
+            # Log access log for error (before flush, so it gets into app_logs)
+            logger.warning(
+                f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+            )
+            
+            # Flush debug logs on error
+            if debug_logger:
+                debug_logger.flush_on_error(response.status_code, error_message)
+            
+            # Return error in Anthropic format
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": error_message
+                    }
+                }
+            )
+        
+        if request_data.stream:
+            # Streaming mode. Kiro intermittently returns a 200 with NO content
+            # (a transient empty completion). We retry it transparently: emit the
+            # message_start once, forward content blocks from whichever attempt
+            # produces them, and drop+retry empty attempts. During retries we emit
+            # SSE `ping` heartbeats so the client's read timeout never fires during a
+            # long empty streak (otherwise pi would "terminate" the request). All
+            # thinking is preserved; the placeholder is only a last-resort safety net.
+            max_empty_retries = int(os.getenv("KIRO_EMPTY_RETRIES", "3"))
+            _PING = 'event: ping\ndata: {"type": "ping"}\n\n'
+
+            async def stream_wrapper():
+                nonlocal response
+                streaming_error = None
+                client_disconnected = False
+                empty_attempts = 0
+                started = False  # whether the single message_start has been emitted
+                try:
+                    while True:
+                        # suppress the converter placeholder on all but the final
+                        # attempt, so a truly-empty stream stays detectable/retryable
+                        suppress = empty_attempts < max_empty_retries
+                        got_content = False   # this attempt produced REAL content
+                        _buf = []             # sniff buffer until we decide real/placeholder
+                        _acc = ""             # accumulated leading text for placeholder sniff
+                        async for chunk in stream_kiro_to_anthropic(
+                            response,
+                            request_data.model,
+                            model_cache,
+                            auth_manager,
+                            request_messages=messages_for_tokenizer,
+                            tool_name_map=tool_name_map,
+                            suppress_empty_placeholder=suppress,
+                            real_input_tokens=real_input_tokens,
+                        ):
+                            _et, _pl = _sse_parse(chunk)
+                            if _et == "message_start":
+                                # emit exactly one message_start; on retry attempts
+                                # send a heartbeat instead so the client stays alive
+                                if not started:
+                                    started = True
+                                    yield chunk
+                                else:
+                                    yield _PING
+                                continue
+                            if got_content:
+                                yield chunk
+                                continue
+                            # --- not yet decided: buffer + sniff for placeholder mimicry ---
+                            # A turn whose ONLY content is a known placeholder string
+                            # (e.g. opus-4.7 returning just "(no output)") is a disguised
+                            # empty completion -> buffer, and if nothing real arrives, retry.
+                            _buf.append(chunk)
+                            if _et == "content_block_start":
+                                _bt = ((_pl or {}).get("content_block") or {}).get("type")
+                                if _bt in ("tool_use", "thinking", "redacted_thinking", "image"):
+                                    got_content = True
+                            elif _et == "content_block_delta":
+                                _d = (_pl or {}).get("delta") or {}
+                                if _d.get("type") == "thinking_delta":
+                                    got_content = True
+                                elif _d.get("type") == "text_delta":
+                                    _acc += _d.get("text") or ""
+                                    # real text once it diverges from every placeholder
+                                    if _acc.strip() and not _text_is_placeholderish(_acc):
+                                        got_content = True
+                            if got_content:
+                                for _c in _buf:
+                                    yield _c
+                                _buf = []
+                        if got_content:
+                            break
+                        # ---- nothing real this attempt (truly empty, or a placeholder-only
+                        # completion like opus-4.7 emitting just "(no output)") -> retry ----
+                        empty_attempts += 1
+                        if empty_attempts > max_empty_retries:
+                            # safety net (final attempt allows the placeholder, so this
+                            # rarely triggers): close the message cleanly.
+                            if not started:
+                                yield "event: message_start\ndata: " + json.dumps({"type": "message_start", "message": {"id": "msg_fallback", "type": "message", "role": "assistant", "model": request_data.model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}}) + "\n\n"
+                            yield 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                            yield 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"(no output)"}}\n\n'
+                            yield 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+                            yield 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}\n\n'
+                            yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                            logger.warning("Empty completion persisted after all retries; emitted placeholder")
+                            break
+                        logger.warning(f"Empty completion from Kiro; retrying upstream ({empty_attempts}/{max_empty_retries})")
+                        yield _PING  # heartbeat right after an empty attempt
+                        try:
+                            await response.aclose()
+                        except Exception:
+                            pass
+                        _delay = min(1.5 * empty_attempts, 6.0)
+                        _slept = 0.0
+                        while _slept < _delay:
+                            await asyncio.sleep(min(2.0, _delay - _slept))
+                            _slept += 2.0
+                            yield _PING  # heartbeat during backoff
+                        response = await http_client.request_with_retry("POST", url, kiro_payload, stream=True)
+                        if response.status_code != 200:
+                            try:
+                                _err = (await response.aread()).decode("utf-8", "replace")
+                            except Exception:
+                                _err = "Unknown error"
+                            yield f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": _err[:200]}})}\n\n'
+                            break
+                except GeneratorExit:
+                    client_disconnected = True
+                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
+                except Exception as e:
+                    streaming_error = e
+                    # Send error event to client, then gracefully end the stream
+                    try:
+                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
+                        yield error_event
+                    except Exception:
+                        pass
+                finally:
+                    await http_client.close()
+                    if streaming_error:
+                        error_type = type(streaming_error).__name__
+                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                        logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                    elif client_disconnected:
+                        logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
+                    else:
+                        logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
+                    
+                    if debug_logger:
+                        if streaming_error:
+                            debug_logger.flush_on_error(500, str(streaming_error))
+                        else:
+                            debug_logger.discard_buffers()
+            
+            return StreamingResponse(
+                stream_wrapper(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                }
+            )
+        
+        else:
+            # Non-streaming mode - collect entire response
+            anthropic_response = await collect_anthropic_response(
+                response,
+                request_data.model,
+                model_cache,
+                auth_manager,
+                request_messages=messages_for_tokenizer,
+                tool_name_map=tool_name_map,
+                real_input_tokens=real_input_tokens,
+            )
+            
+            await http_client.close()
+            
+            logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
+            
+            if debug_logger:
+                debug_logger.discard_buffers()
+            
+            return JSONResponse(content=anthropic_response)
+    
+    except HTTPException as e:
+        await http_client.close()
+        logger.error(f"HTTP {e.status_code} - POST /v1/messages - {e.detail}")
+        if debug_logger:
+            debug_logger.flush_on_error(e.status_code, str(e.detail))
+        raise
+    except Exception as e:
+        await http_client.close()
+        logger.error(f"Internal error: {e}", exc_info=True)
+        logger.error(f"HTTP 500 - POST /v1/messages - {str(e)[:100]}")
+        if debug_logger:
+            debug_logger.flush_on_error(500, str(e))
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"Internal Server Error: {str(e)}"
+                }
+            }
+        )
+
+
+# ==================================================================================================
+# /v1/messages/count_tokens — local token estimation
+# ==================================================================================================
+#
+# Anthropic spec: https://docs.anthropic.com/en/api/messages-count-tokens
+# Request body mirrors /v1/messages (without max_tokens / stream).
+# Response: {"input_tokens": <int>}.
+#
+# Kiro has no equivalent endpoint, so we estimate locally with tiktoken
+# (same approach used elsewhere in the gateway). Approximate but stable.
+
+class _CountTokensRequest(AnthropicMessagesRequest):
+    """count_tokens uses the same shape as /v1/messages but max_tokens is optional."""
+    max_tokens: Optional[int] = None
+
+
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_anthropic_api_key)])
+async def count_tokens_endpoint(request_data: _CountTokensRequest):
+    """
+    Estimate input token count for an Anthropic Messages-style request.
+
+    Returns:
+        JSON: {"input_tokens": int}
+    """
+    # Reuse the same dump shape as the streaming path uses for tokenization.
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    tools_for_tokenizer = (
+        [tool.model_dump() for tool in request_data.tools]
+        if request_data.tools else None
+    )
+
+    # System prompt may be a string or a list of content blocks.
+    system_text = ""
+    if request_data.system:
+        if isinstance(request_data.system, str):
+            system_text = request_data.system
+        elif isinstance(request_data.system, list):
+            parts = []
+            for block in request_data.system:
+                if isinstance(block, dict):
+                    parts.append(block.get("text", ""))
+                else:
+                    parts.append(getattr(block, "text", "") or "")
+            system_text = "\n".join(p for p in parts if p)
+
+    total = count_message_tokens(messages_for_tokenizer)
+    total += count_tools_tokens(tools_for_tokenizer)
+    if system_text:
+        total += count_tokens(system_text)
+
+    return JSONResponse(content={"input_tokens": int(total)})

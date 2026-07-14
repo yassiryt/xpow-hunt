@@ -1,0 +1,60 @@
+{
+  "providers": {
+    "kiro": {
+      "baseUrl": "http://127.0.0.1:8790",
+      "api": "anthropic-messages",
+      "apiKey": "xpow-gateway-local-7Qx2Zr9TtVb",
+      "models": [
+        {
+          "id": "claude-opus-4.8",
+          "name": "Claude Opus 4.8 (Kiro)",
+          "reasoning": true,
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh" },
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 128000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "claude-opus-4.7",
+          "name": "Claude Opus 4.7 (Kiro)",
+          "reasoning": true,
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh" },
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 128000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "claude-opus-4.6",
+          "name": "Claude Opus 4.6 (Kiro)",
+          "reasoning": true,
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh" },
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 64000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "claude-opus-4.5",
+          "name": "Claude Opus 4.5 (Kiro)",
+          "reasoning": false,
+          "input": ["text", "image"],
+          "contextWindow": 200000,
+          "maxTokens": 64000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "claude-sonnet-4.6",
+          "name": "Claude Sonnet 4.6 (Kiro)",
+          "reasoning": true,
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh" },
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 64000,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}

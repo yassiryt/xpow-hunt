@@ -1,0 +1,12 @@
+.DS_Store
+.browser-live/
+credentials.json
+kiro-gateway/.env
+data/memory.jsonl
+reports/
+*.bak-*
+*.log
+*.pid
+.venv/
+node_modules/
+__pycache__/

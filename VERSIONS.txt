@@ -1,0 +1,53 @@
+# xpow-hunt — captured toolchain versions (source machine)
+# Match these (or newer compatible) on the new machine.
+
+OS                 : Linux (x86-64)
+node               : v22.22.3      # required for pi + MCP bridge + extensions (.ts)
+npm                : 10.9.8
+python3            : 3.13.7        # gateway venv (3.11+ works)
+pi (pi.dev)        : @earendil-works/pi-coding-agent@0.79.0   # npm global
+
+# Gateway python deps (kiro-gateway/requirements.txt):
+fastapi
+uvicorn[standard]
+httpx[socks]
+loguru
+python-dotenv
+tiktoken
+pytest            # test-only
+pytest-asyncio    # test-only
+hypothesis        # test-only
+
+# MCP bridge node dep (pi-agent/extensions/mcp-bridge/package.json):
+@modelcontextprotocol/sdk ^1.13.0
+
+# Subagent extension modules (pi-agent/extensions/subagent/ — no extra npm deps,
+# uses pi's bundled types; loaded via Node 22 type-stripping):
+#   index.ts        # tool: single/parallel/chain + ensemble + swarm modes,
+#                   #   RAM gate (5-min wait), per-agent MCP profiles, depth cap,
+#                   #   retry-on-empty, reflexive disconfirmation gate
+#   ensemble.ts     # ensemble/swarm task builders
+#   disconfirm.ts   # verdict classifier + disconfirmation-task builder (Vector #1)
+#   mcp-profiles.ts # per-agent PI_MCP_ONLY profiles (RAM control)
+#   agents.ts       # agent discovery
+#   selftest.mjs    # offline logic self-test (run by install.sh verify step)
+
+# System tools expected on PATH:
+curl, git, rsync
+java               # burp MCP proxy jar (e.g. apt install default-jre)
+chromium           # browser-live (/usr/bin/chromium, or set BROWSER_LIVE_CHROME_BIN)
+fd                 # a prebuilt x86-64 fd is bundled at pi-agent/bin/fd; on a different
+                   # arch install fd-find instead (apt install fd-find / cargo install fd-find)
+
+# MCP server implementations — ALL BUNDLED in mcp-servers/ (installer places + npm ci):
+#   browser-live   -> ~/.claude/mcp/            (+ chrome-devtools-mcp via npm ci)
+#   burp           -> ~/.BurpSuite/mcp-proxy/mcp-proxy-all.jar  (needs Burp app + ext on :9876)
+#   medium         -> ~/opencode/medium-rss-mcp/server.mjs
+#   memory         -> npx @modelcontextprotocol/server-memory   (data seeded from data/memory.jsonl)
+#   github         -> remote URL; token injected at install (GITHUB_MCP_TOKEN)
+#   gmail          -> npx @gongrzhe/server-gmail-autoauth-mcp    (OAuth creds machine-specific)
+
+# SECRETS / PER-MACHINE (NOT bundled — must be redone):
+kiro-cli           # gateway's auth source; install + `kiro-cli login`
+GITHUB_MCP_TOKEN   # github MCP (ghp_…) — pass to install.sh or edit mcp.json
+~/.gmail-mcp/      # gcp-oauth.keys.json + credentials.json for gmail MCP, then auth flow

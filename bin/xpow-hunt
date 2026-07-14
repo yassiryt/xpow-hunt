@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# xpow-hunt — Pi-based security research coordinator with selectable gateways.
+set -euo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/xpow-hunt"
+BACKEND_FILE="$CONFIG_HOME/backend"
+BACKEND="${XPOW_GATEWAY:-}"
+
+if [ "${1:-}" = "--gateway" ] || [ "${1:-}" = "-g" ]; then
+  [ -n "${2:-}" ] || { echo "xpow-hunt: --gateway requires kiro, claude, or zai" >&2; exit 2; }
+  BACKEND="$2"
+  shift 2
+fi
+
+if [ -z "$BACKEND" ] && [ -r "$BACKEND_FILE" ]; then BACKEND="$(tr -d '[:space:]' < "$BACKEND_FILE")"; fi
+BACKEND="${BACKEND:-kiro}"
+
+BUILD="$HOME/.config/opencode/prompts/claude-agents/build.md"
+FLOW="$HOME/.kiro/steering/bugbounty-autoflow.md"
+ADAPT="$HOME/.pi/agent/pi-coordinator-adapter.md"
+for file in "$BUILD" "$FLOW" "$ADAPT"; do
+  [ -r "$file" ] || { echo "xpow-hunt: missing coordinator file: $file" >&2; exit 1; }
+done
+
+export PI_AUTOCONTINUE="${PI_AUTOCONTINUE:-0}"
+COMMON=(--append-system-prompt "$BUILD" --append-system-prompt "$FLOW" --append-system-prompt "$ADAPT")
+
+case "$BACKEND" in
+  kiro)
+    exec xpow-gateway --model "${XPOW_KIRO_MODEL:-kiro/claude-opus-4.8:xhigh}" "${COMMON[@]}" "$@"
+    ;;
+  claude|anthropic)
+    [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "xpow-hunt: ANTHROPIC_API_KEY is required for the Claude gateway" >&2; exit 1; }
+    exec pi --model "${XPOW_CLAUDE_MODEL:-anthropic/claude-opus-4-6:high}" "${COMMON[@]}" "$@"
+    ;;
+  zai|glm)
+    [ -n "${ZAI_API_KEY:-}" ] || { echo "xpow-hunt: ZAI_API_KEY is required for the Z.ai gateway" >&2; exit 1; }
+    exec pi --model "${XPOW_ZAI_MODEL:-zai/glm-5.2:high}" "${COMMON[@]}" "$@"
+    ;;
+  *)
+    echo "xpow-hunt: unknown gateway '$BACKEND' (choose: kiro, claude, zai)" >&2
+    exit 2
+    ;;
+esac
