@@ -1,5 +1,8 @@
 # xpow-hunt
 
+> [!CAUTION]
+> **Authorized security research only.** A public target, account, API key, or bug-bounty listing does not automatically authorize every test. Confirm written scope before each engagement, use the least invasive proof, and stop whenever authorization or impact is unclear. Read the full [Legal and Responsible-Use Disclaimer](DISCLAIMER.md) before installing or using this project.
+
 `xpow-hunt` is a Pi-based security research coordinator for authorized bug-bounty work. It combines a primary coordinator, 23 focused subagents, a Kiro compatibility gateway, MCP integrations, deterministic scope checks, and a broad recon toolchain behind one command.
 
 It supports three model routes:
@@ -8,7 +11,7 @@ It supports three model routes:
 - **Claude** — connects directly through Pi's native Anthropic provider.
 - **Z.ai** — connects directly through Pi's native Z.ai provider.
 
-> Use this project only on systems you own or are explicitly authorized to test. Program scope and safe-proof rules always take priority.
+No prompt, scope engine, model, or automated control can make a legal determination for you. You remain responsible for every command and tool call.
 
 ## How it works
 
@@ -306,6 +309,12 @@ This repository intentionally excludes:
 - Logs, PIDs, virtual environments, and installed dependencies.
 
 Configuration templates use `__XPOW_HOME__`, which the installer resolves locally. Do not commit generated credentials, `.env` files, `reports/`, or memory databases.
+
+## Legal terms
+
+The project is provided as-is, without warranty. Its authors and contributors do not authorize unlawful access or testing outside an approved scope and, to the maximum extent permitted by law, disclaim liability for use or misuse. Third-party tools and services have their own terms and licenses.
+
+These short terms are only a summary. The complete conditions, limitations, user responsibilities, third-party notice, and no-safe-harbor warning are in [DISCLAIMER.md](DISCLAIMER.md). A disclaimer cannot replace written authorization from the owner of a target or advice from a qualified lawyer.
 
 ## Upstream and licensing
 
